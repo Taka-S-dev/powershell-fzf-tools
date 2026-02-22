@@ -98,18 +98,40 @@ powershell
 # --- Common fd Options ---
 $fdOpts = @("--no-ignore", "--exclude", "node_modules", "--exclude", ".git", "--exclude", "dist", "--exclude", "build")
 
-# [o] Browse directories and open selected one(s) in File Explorer.
+# [o] Explore
 function Invoke-FzfExplore {
     if (-not (Test-CommandExists fd) -or -not (Test-CommandExists fzf)) { return }
-    $selected = fd -t d @fdOpts | fzf -m --height 40% --layout=reverse --border --header='[o] Explore'
-    if ($selected) {
-        foreach ($s in $selected) {
-            Start-Process explorer.exe ($s.Trim([char]0xfeff).Trim())
-        }
-    }
+
+    $tmp = [System.IO.Path]::GetTempFileName() + ".ps1"
+    @'
+$path = $args[0].Trim()
+Start-Process explorer.exe $path
+'@ | Set-Content $tmp -Encoding UTF8
+
+    fd -t d @fdOpts | fzf --height 100% --layout=reverse --border --header='[o] Explore | Enter=Open | Ctrl-C=Close' --bind="enter:execute(powershell -NoProfile -File `"$tmp`" {})+clear-selection"
+
+    Remove-Item $tmp -ErrorAction SilentlyContinue
 }
 
-# [c] Fast directory navigation (cd) using fuzzy search.
+# [of] Explore with files - Enter opens parent directory in Explorer
+function Invoke-FzfExploreFile {
+    if (-not (Test-CommandExists fd) -or -not (Test-CommandExists fzf)) { return }
+
+    $tmp = [System.IO.Path]::GetTempFileName() + ".ps1"
+    @'
+$path = $args[0].Trim()
+$parent = Split-Path $path -Parent
+if (-not $parent) { $parent = "." }
+Start-Process explorer.exe $parent
+'@ | Set-Content $tmp -Encoding UTF8
+
+    fd @fdOpts | fzf --height 100% --layout=reverse --border --header='[of] Explore File | Enter=Open parent dir | Ctrl-C=Close' --bind="enter:execute(powershell -NoProfile -File `"$tmp`" {})+clear-selection"
+
+    Remove-Item $tmp -ErrorAction SilentlyContinue
+}
+
+
+# [c] CD
 function Invoke-FzfCd {
     if (-not (Test-CommandExists fd) -or -not (Test-CommandExists fzf)) { return }
     $s = fd -t d @fdOpts | fzf --height 40% --layout=reverse --border --header='[c] CD'
@@ -118,7 +140,7 @@ function Invoke-FzfCd {
     }
 }
 
-# [e] Search files and open the selected file(s) in the editor.
+# [e] Edit
 function Invoke-FzfEdit {
     if (-not (Test-CommandExists fd) -or -not (Test-CommandExists fzf)) { return }
     $selected = fd -t f @fdOpts | fzf -m --height 60% --layout=reverse --border --header='[e] Editor'
@@ -129,7 +151,7 @@ function Invoke-FzfEdit {
     }
 }
 
-# [fcp] Copy full absolute path(s) to clipboard.
+# [fcp] Copy Path
 function Invoke-FzfCopy {
     if (-not (Test-CommandExists fd) -or -not (Test-CommandExists fzf)) { return }
     $selected = fd -t f -a @fdOpts | fzf -m --height 40% --layout=reverse --border --header='[fcp] Copy Path'
@@ -141,7 +163,7 @@ function Invoke-FzfCopy {
     }
 }
 
-# [oe] Open current (or specified) folder in the editor.
+# [oe] Open Editor
 function Invoke-OpenEditor {
     param([string]$Path = ".")
     $resolved = Resolve-Path $Path -ErrorAction SilentlyContinue
@@ -154,22 +176,25 @@ function Invoke-OpenEditor {
 
 # --- Aliases ---
 Set-Alias -Name o   -Value Invoke-FzfExplore -Force
+Set-Alias -Name of  -Value Invoke-FzfExploreFile -Force
 Set-Alias -Name c   -Value Invoke-FzfCd      -Force
 Set-Alias -Name e   -Value Invoke-FzfEdit    -Force
 Set-Alias -Name fcp -Value Invoke-FzfCopy    -Force
 Set-Alias -Name oe  -Value Invoke-OpenEditor -Force
+
 ```
 
 ## 1.3 使い方まとめ
 
-| **コマンド** | **動作**                                    |
-| ------------ | ------------------------------------------- |
-| `o`          | フォルダを検索 → **エクスプローラー**で開く |
-| `c`          | フォルダを検索 → **その場所に移動**         |
-| `e`          | ファイルを検索 → **エディタ**で開く         |
-| `fcp`        | ファイルを検索 → **ファイルパス**をコピー   |
-| `oe`         | 現在のフォルダをエディタで開く              |
-| `oe <path>`  | 指定フォルダをエディタで開く                |
+| **コマンド** | **動作**                                                             |
+| ------------ | -------------------------------------------------------------------- |
+| `o`          | フォルダを検索 → **エクスプローラー**で開く                          |
+| `of`         | ファイル/フォルダを検索 → **親ディレクトリ**をエクスプローラーで開く |
+| `c`          | フォルダを検索 → **その場所に移動**                                  |
+| `e`          | ファイルを検索 → **エディタ**で開く                                  |
+| `fcp`        | ファイルを検索 → **ファイルパス**をコピー                            |
+| `oe`         | 現在のフォルダをエディタで開く                                       |
+| `oe <path>`  | 指定フォルダをエディタで開く                                         |
 
 ## 1.3.1 fzf画面での操作
 
@@ -558,6 +583,7 @@ function Show-ToolkitHelp {
     Write-Host ""
     Write-Host "  [Part A] fd + fzf  -------------------------" -ForegroundColor Yellow
     Write-Host "   o          Search folders  -> Open in Explorer"
+    Write-Host "   of         Search files+folders -> Open parent dir in Explorer"
     Write-Host "   c          Search folders  -> CD"
     Write-Host "   e          Search files    -> Open in Editor"
     Write-Host "   fcp        Search files    -> Copy path"
