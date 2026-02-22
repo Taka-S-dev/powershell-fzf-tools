@@ -1,0 +1,42 @@
+# --- Version Control Systems ---
+.git/
+.svn/
+.hg/
+
+# --- Build Artifacts (General) ---
+DEBUG/
+RELEASE/
+build/
+dist/
+bin/
+obj/
+*.exe
+*.dll
+*.pdb
+
+# --- Firmware / Embedded Artifacts ---
+*.obj
+*.o
+*.bin
+*.hex
+*.elf
+*.map
+*.lst
+*.lib
+*.a
+*.so
+
+# --- Scripting / Web Development ---
+node_modules/
+__pycache__/
+.venv/
+.env
+
+# --- OS / IDE Specific ---
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+*.tmp
+*.log
