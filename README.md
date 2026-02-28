@@ -303,7 +303,12 @@ powershell
 # Dependencies: rg, fzf, bat
 # ==============================================================================
 
-$script:FsExtensions  = @()
+# --- Default Extension Filter ---
+# Customize here to pre-select extensions on every new session.
+# Example: $script:FsDefaultExtensions = @("c", "h")
+$script:FsDefaultExtensions = @()
+
+$script:FsExtensions  = $script:FsDefaultExtensions
 $script:FsCacheFile   = Join-Path $env:TEMP "fs_last_results.txt"
 $script:FsSearchMode  = @("--smart-case")
 $extHistFile = "$HOME\.fs_ext_history"
@@ -361,16 +366,23 @@ if (Test-Path -LiteralPath $fullPath) {
 
 # [fsm] Search Mode
 function Set-FsMode {
-    $modes = @("smart-case (default)", "case-sensitive", "ignore-case", "word-match", "word + case-sensitive", "word + ignore-case")
+    $modes = @(
+        "smart            lower=ignore-case / UPPER=match-case  [default]",
+        "sensitive        always match case  (Foo != foo)",
+        "insensitive      always ignore case  (Foo == foo)",
+        "word             whole word + smart  (log won't match logging)",
+        "word+sensitive   whole word + match case",
+        "word+insensitive whole word + ignore case"
+    )
     $selected = $modes | fzf --height 40% --layout=reverse --border --no-mouse --header="Search mode"
     if ($selected) {
-        switch ($selected) {
-            "smart-case (default)"  { $script:FsSearchMode = @("--smart-case") }
-            "case-sensitive"        { $script:FsSearchMode = @("--case-sensitive") }
-            "ignore-case"           { $script:FsSearchMode = @("--ignore-case") }
-            "word-match"            { $script:FsSearchMode = @("--smart-case", "--word-regexp") }
-            "word + case-sensitive" { $script:FsSearchMode = @("--case-sensitive", "--word-regexp") }
-            "word + ignore-case"    { $script:FsSearchMode = @("--ignore-case", "--word-regexp") }
+        switch -Wildcard ($selected) {
+            "smart*"            { $script:FsSearchMode = @("--smart-case") }
+            "word+sensitive*"   { $script:FsSearchMode = @("--case-sensitive", "--word-regexp") }
+            "word+insensitive*" { $script:FsSearchMode = @("--ignore-case", "--word-regexp") }
+            "word*"             { $script:FsSearchMode = @("--smart-case", "--word-regexp") }
+            "sensitive*"        { $script:FsSearchMode = @("--case-sensitive") }
+            "insensitive*"      { $script:FsSearchMode = @("--ignore-case") }
         }
         Write-Host " [ MODE ] >>> $selected" -ForegroundColor Green
     }
@@ -379,14 +391,29 @@ function Set-FsMode {
 # [fse] Extension Filter
 function Set-FsExt {
     if (-not (Test-Path $extHistFile)) { New-Item $extHistFile -Force | Out-Null }
-    $defaultExts = @("all","py","ts","js","tsx","jsx","go","rs","cs","cpp","c","rb","java","kt","vue","svelte")
+    $defaultExts = @("all","py","ts","js","tsx","jsx","go","rs","cs","cpp","c","h","rb","java","kt","vue","svelte")
     $savedExts   = @(Get-Content $extHistFile -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\w+$' })
     $allExts     = @($defaultExts) + @($savedExts | Where-Object { $defaultExts -notcontains $_ }) | Select-Object -Unique
-    $fzfResult = $allExts | fzf --multi --height 40% --layout=reverse --border --no-mouse --header="Ext" --print-query
+
+    # Currently active extensions shown first so they're easy to re-select or remove
+    $activeExts  = @($script:FsExtensions | Where-Object { $allExts -contains $_ })
+    $restExts    = @($allExts | Where-Object { $activeExts -notcontains $_ })
+    $orderedExts = @($activeExts) + @($restExts)
+    $activeLabel = if ($activeExts.Count -gt 0) { $activeExts -join "," } else { "all" }
+
+    $fzfResult = $orderedExts | fzf --multi --height 40% --layout=reverse --border --no-mouse --header="Ext | current: $activeLabel" --print-query
     $typedQuery = $fzfResult | Select-Object -First 1
     $selectedExts = @($fzfResult | Select-Object -Skip 1 | Where-Object { $_ -match '^\w+$' })
     if ($selectedExts.Count -eq 0 -and $typedQuery -ne "") { $selectedExts = @($typedQuery) }
     $script:FsExtensions = $selectedExts
+
+    # Save any newly typed (non-default, non-already-saved) extensions to history
+    foreach ($ext in $selectedExts) {
+        if ($ext -match '^\w+$' -and $defaultExts -notcontains $ext -and $savedExts -notcontains $ext) {
+            Add-Content $extHistFile $ext -Encoding UTF8
+        }
+    }
+
     Write-Host " [ EXT ] >>> $($selectedExts -join ', ')" -ForegroundColor Green
 }
 
@@ -401,43 +428,95 @@ function Remove-FsExtHistory {
 function Invoke-FzfGrepFilter {
     if (-not (Test-Path $script:FsCacheFile)) { Write-Host "Run fs first" -ForegroundColor Yellow; return }
 
-    $tmpOpen = _FsMakeTmpOpen; $tmpPreview = _FsMakeTmpPreview
-    $bindCmd = "enter:execute(powershell -NoProfile -File `"$tmpOpen`" {})+clear-selection"
+    $tmpOpen    = _FsMakeTmpOpen
+    $tmpPreview = _FsMakeTmpPreview
+    $bindCmd    = "enter:execute-silent(powershell -NoProfile -WindowStyle Hidden -File `"$tmpOpen`" {})+clear-selection"
     $previewCmd = "powershell -NoProfile -File `"$tmpPreview`" {}"
 
-    # Load results from cache file and pipe into fzf
-    Get-Content $script:FsCacheFile | fzf --ansi --height 100% --layout=reverse --border --header="[fsg] Filter Mode | F2=Preview" --preview=$previewCmd --preview-window="right:50%:hidden:wrap" --bind="f2:toggle-preview" --bind=$bindCmd
+    Get-Content $script:FsCacheFile | fzf --ansi --height 100% --layout=reverse --border --no-sort --exact --delimiter=":" --header="[fsg] F2=Preview  Alt-S=Sort  Alt-F=FileOnly  Alt-A=All" --preview=$previewCmd --preview-window="right:50%:hidden:wrap" --bind="f2:toggle-preview" --bind="alt-s:toggle-sort" --bind="alt-f:change-nth(1)+change-prompt([file] )" --bind="alt-a:change-nth()+change-prompt([fsg] )" --bind=$bindCmd
 
     Remove-Item $tmpOpen, $tmpPreview -ErrorAction SilentlyContinue
 }
 
 # [fs] Main Search Function
 function Invoke-FzfGrep {
-    $query = Read-Host "Search for"
-    if (-not $query) { return }
+    param([string]$Query)
+    if (-not $Query) { $Query = Read-Host "Search for" }
+    if (-not $Query) { return }
+    $query = $Query
 
-    $tmpOpen = _FsMakeTmpOpen; $tmpPreview = _FsMakeTmpPreview
-    $bindCmd = "enter:execute(powershell -NoProfile -File `"$tmpOpen`" {})+clear-selection"
+    $tmpOpen    = _FsMakeTmpOpen
+    $tmpPreview = _FsMakeTmpPreview
+    $bindCmd    = "enter:execute-silent(powershell -NoProfile -WindowStyle Hidden -File `"$tmpOpen`" {})+clear-selection"
     $previewCmd = "powershell -NoProfile -File `"$tmpPreview`" {}"
 
     $rgArgs = @("--line-number", "--column", "--color=always", "--no-ignore", "--max-columns", "200")
     $rgArgs += @("--glob", "!node_modules", "--glob", "!dist", "--glob", "!.git")
+    $rgArgs += "--sort=path"
     $rgArgs += $script:FsSearchMode
     if ($script:FsExtensions.Count -gt 0 -and $script:FsExtensions -notcontains "all") {
         foreach ($ext in $script:FsExtensions) { $rgArgs += "--glob"; $rgArgs += "*.$ext" }
     }
     $rgArgs += $query
 
-    Write-Host " [ SEARCHING... ]" -ForegroundColor Cyan
+    $extLabel = if ($script:FsExtensions.Count -eq 0 -or $script:FsExtensions -contains 'all') { 'all' } else { $script:FsExtensions -join ',' }
+    $fzfArgs = @(
+        "--ansi", "--height", "100%", "--layout=reverse", "--border",
+        "--no-sort", "--exact",
+        "--delimiter=:",
+        "--header=[fs] $query | EXT:$extLabel | F2=Preview  Alt-S=Sort  Alt-F=FileOnly  Alt-A=All",
+        "--preview=$previewCmd",
+        "--preview-window=right:50%:hidden:wrap",
+        "--bind=f2:toggle-preview",
+        "--bind=alt-s:toggle-sort",
+        "--bind=alt-f:change-nth(1)+change-prompt([file] )",
+        "--bind=alt-a:change-nth()+change-prompt([fs] )",
+        "--bind=$bindCmd"
+    )
 
-    # Stream results to fzf while simultaneously writing to cache file for fsg
-    & rg @rgArgs | Tee-Object -FilePath $script:FsCacheFile | fzf --ansi --height 100% --layout=reverse --border --header="[fs] $query | F2=Preview  fsg=Filter" --preview=$previewCmd --preview-window="right:50%:hidden:wrap" --bind="f2:toggle-preview" --bind=$bindCmd
+    & rg @rgArgs | Tee-Object -FilePath $script:FsCacheFile | fzf @fzfArgs
+
+    Remove-Item $tmpOpen, $tmpPreview -ErrorAction SilentlyContinue
+}
+
+# [fsl] Live Search
+function Invoke-FzfLiveSearch {
+    $tmpOpen    = _FsMakeTmpOpen
+    $tmpPreview = _FsMakeTmpPreview
+
+    # Build rg args directly — no PowerShell subprocess in reload
+    $rgArgs = @("--line-number", "--column", "--color=always", "--no-ignore", "--max-columns", "200",
+                "--glob=!node_modules", "--glob=!dist", "--glob=!.git")
+    $rgArgs += $script:FsSearchMode
+    if ($script:FsExtensions.Count -gt 0 -and $script:FsExtensions -notcontains "all") {
+        foreach ($ext in $script:FsExtensions) { $rgArgs += "--glob=*.$ext" }
+    }
+    $rgCmd = "rg " + ($rgArgs -join " ") + " -- {q}"
+
+    $bindOpen   = "enter:execute-silent(powershell -NoProfile -WindowStyle Hidden -File `"$tmpOpen`" {})+clear-selection"
+    $previewCmd = "powershell -NoProfile -File `"$tmpPreview`" {}"
+    $extLabel   = if ($script:FsExtensions.Count -eq 0 -or $script:FsExtensions -contains 'all') { 'all' } else { $script:FsExtensions -join ',' }
+
+    $fzfArgs = @(
+        "--ansi", "--height", "100%", "--layout=reverse", "--border",
+        "--disabled",
+        "--prompt=[fsl] ",
+        "--header=EXT:$extLabel | F2=Preview  Enter=Open",
+        "--preview=$previewCmd",
+        "--preview-window=right:50%:hidden:wrap",
+        "--bind=f2:toggle-preview",
+        "--bind=change:reload($rgCmd)+first",
+        "--bind=$bindOpen"
+    )
+
+    @() | fzf @fzfArgs
 
     Remove-Item $tmpOpen, $tmpPreview -ErrorAction SilentlyContinue
 }
 
 # --- Aliases ---
 Set-Alias fs  Invoke-FzfGrep       -Force
+Set-Alias fsl Invoke-FzfLiveSearch -Force
 Set-Alias fsg Invoke-FzfGrepFilter -Force
 Set-Alias fse Set-FsExt            -Force
 Set-Alias fsd Remove-FsExtHistory  -Force
@@ -447,74 +526,99 @@ Set-Alias fsm Set-FsMode           -Force
 
 ## 2.3 使い方まとめ
 
-| **コマンド** | **動作**                                         |
-| ------------ | ------------------------------------------------ |
-| `fs`         | キーワードでコード内を検索してエディタで開く     |
-| `fse`        | 検索対象の拡張子をセット（セッション中保持）     |
-| `fsm`        | 検索モードをセット（大文字小文字・単語一致など） |
-| `fsg`        | 直前の `fs` 結果をファイル名で絞り込む           |
-| `fsd`        | `fse` で追加した拡張子の履歴を削除する           |
+| **コマンド** | **動作**                                                         |
+| ------------ | ---------------------------------------------------------------- |
+| `fs`         | キーワードでコード内を検索してエディタで開く（パス順ソート）     |
+| `fs <word>`  | キーワードを直接渡して検索（`fs "my keyword"` でスペース含む）  |
+| `fsl`        | タイプするたびにリアルタイムで検索結果が更新されるライブ検索     |
+| `fse`        | 検索対象の拡張子をセット（セッション中保持）                     |
+| `fsm`        | 検索モードをセット（大文字小文字・単語一致など）                 |
+| `fsg`        | 直前の `fs` 結果を絞り込む                                       |
+| `fsd`        | `fse` で追加した拡張子の履歴を削除する                           |
 
 ### 基本的な使い方の流れ
 
 1. `fse` で検索対象の拡張子をセット（省略時は全ファイル対象）
-2. `fsm` で検索モードをセット（省略時は smart-case）
-3. `fs` でキーワードを入力して検索
+2. `fsm` で検索モードをセット（省略時は smart）
+3. `fs` でキーワードを入力して検索（または `fsl` でライブ検索）
 4. fzf画面で候補を選び **Enter** でエディタの該当行に直接ジャンプ
-5. ヒット件数が多い場合は `fsg` でファイル名絞り込み
+5. ヒット件数が多い場合は `fsg` でさらに絞り込み
 
-### fs 画面での操作
+### fs / fsl / fsg 画面での操作
 
-| **操作**     | **動作**                              |
-| ------------ | ------------------------------------- |
-| **文字入力** | fzf上でさらに絞り込み                 |
-| **上下キー** | 候補を選択                            |
-| **Enter**    | エディタの該当行に直接ジャンプ        |
-| **F2**       | プレビュー（前後コード）の表示/非表示 |
-| **Ctrl-C**   | 終了                                  |
+| **操作**        | **動作**                                     |
+| --------------- | -------------------------------------------- |
+| **文字入力**    | fzf上でさらに絞り込み（完全一致モード）      |
+| **上下キー**    | 候補を選択                                   |
+| **Enter**       | エディタの該当行に直接ジャンプ               |
+| **F2**          | プレビュー（前後コード）の表示/非表示        |
+| **Alt-S**       | ソートのON/OFF切り替え                       |
+| **Alt-F**       | ファイル名のみで絞り込むモードに切り替え     |
+| **Alt-A**       | 全フィールド（ファイル名+行内容）に戻す      |
+| **Ctrl-C**      | 終了                                         |
 
 ## 2.4 fse：拡張子フィルタの詳細
 
 `fs` を実行するたびに拡張子を選ぶのは面倒なので、`fse` で事前にセットしておく方式です。
 
+- ヘッダーに現在有効な拡張子が `current: ts,tsx` のように表示される
+- 現在有効な拡張子はリストの先頭に表示されるので再選択・解除が簡単
 - **Tab** で複数選択可能（例：`ts` と `tsx` を同時に選択）
 - リストにない拡張子は直接入力すると自動で履歴に保存される
 - **Esc** を押すと全拡張子が対象（`all`）になる
 - `fsd` で履歴に追加した拡張子を削除できる
 
-デフォルトで選択できる拡張子：`all`, `py`, `ts`, `js`, `tsx`, `jsx`, `go`, `rs`, `cs`, `cpp`, `c`, `rb`, `java`, `kt`, `vue`, `svelte`
+デフォルトで選択できる拡張子：`all`, `py`, `ts`, `js`, `tsx`, `jsx`, `go`, `rs`, `cs`, `cpp`, `c`, `h`, `rb`, `java`, `kt`, `vue`, `svelte`
+
+### セッション開始時のデフォルト拡張子
+
+毎回 `fse` を実行しなくても、特定の拡張子を常に有効にしたい場合はスクリプト内の変数を変更します。
+
+```powershell
+# Example: C/C++ プロジェクト専用環境
+$script:FsDefaultExtensions = @("c", "h")
+```
 
 ## 2.5 fsm：検索モードの詳細
 
 検索キーワードを `log` とした場合の例です。
 
-| **モード**              | **動作**                              | ✅ ヒット         | ❌ スルー                |
-| ----------------------- | ------------------------------------- | ----------------- | ------------------------ |
-| `smart-case (default)`  | 小文字→大文字無視、大文字を含むと区別 | `log` `Log` `LOG` | -                        |
-| `smart-case (default)`  | 〃（`Log` で検索した場合）            | `Log`             | `log` `LOG`              |
-| `case-sensitive`        | 大文字小文字を厳密に区別              | `log`             | `Log` `LOG`              |
-| `ignore-case`           | 大文字小文字を常に無視                | `log` `Log` `LOG` | -                        |
-| `word-match`            | 単語の完全一致のみ                    | `log`             | `logger` `blog` `dialog` |
-| `word + case-sensitive` | 単語一致 + 大文字小文字区別           | `log`             | `Log` `logger` `blog`    |
-| `word + ignore-case`    | 単語一致 + 大文字小文字無視           | `log` `Log` `LOG` | `logger` `blog`          |
+| **モード**        | **動作**                                              | ✅ ヒット         | ❌ スルー                |
+| ----------------- | ----------------------------------------------------- | ----------------- | ------------------------ |
+| `smart` (default) | lowercase → ignore case / UPPERCASE → match case      | `log` `Log` `LOG` | -                        |
+| `smart` (default) | 〃（`Log` で検索した場合）                            | `Log`             | `log` `LOG`              |
+| `sensitive`       | always match case                                     | `log`             | `Log` `LOG`              |
+| `insensitive`     | always ignore case                                    | `log` `Log` `LOG` | -                        |
+| `word`            | whole word + smart                                    | `log`             | `logger` `blog` `dialog` |
+| `word+sensitive`  | whole word + match case                               | `log`             | `Log` `logger` `blog`    |
+| `word+insensitive`| whole word + ignore case                              | `log` `Log` `LOG` | `logger` `blog`          |
 
-**word-match が便利なケース**：変数名 `id` を検索したいが `valid` や `userId` もヒットしてしまう場合など、ノイズを減らしたいときに使います。
+**word が便利なケース**：変数名 `id` を検索したいが `valid` や `userId` もヒットしてしまう場合など、ノイズを減らしたいときに使います。
 
-## 2.6 fsg：ファイル絞り込みの詳細
+## 2.6 fsg：絞り込みの詳細
 
 `fs` の検索結果が大量にある場合に使います。
 
 1. `fs` でキーワード検索（例：`Pin` で2000件ヒット）
 2. **Ctrl-C** で一旦閉じる
-3. `fsg` を実行 → ヒットしたファイル名一覧が表示される
-4. **Tab** で見たいファイルを選んで **Enter**
-5. 選んだファイルの結果だけが表示される
+3. `fsg` を実行 → 直前の `fs` 結果が表示される
+4. **Alt-F** でファイル名のみモードに切り替えて絞り込み
+5. **Alt-A** で全フィールド表示に戻す
+6. **Enter** でエディタの該当行にジャンプ
 
 **注意**：`fsg` は直前の `fs` 結果をキャッシュファイルに保持しているため、`fs` を再実行すると結果が上書きされます。
 
-## 2.7 検索対象と除外設定
+## 2.7 fsl：ライブ検索の詳細
 
-`fs` はデフォルトで以下のファイル・フォルダを除外します。
+`fsl` を起動すると入力プロンプト `[fsl]` が表示され、タイプするたびに即座に検索が走ります。
+
+- `fs` との違い：事前にキーワードを確定する必要がなく、タイプしながら結果を確認できる
+- `fse` / `fsm` の設定を引き継ぐ（起動時点の設定を使用）
+- 結果はキャッシュに保存されないため、`fsg` との連携はできない
+
+## 2.8 検索対象と除外設定
+
+`fs` / `fsl` はデフォルトで以下のファイル・フォルダを除外します。
 
 | **除外対象**     | **理由**                               |
 | ---------------- | -------------------------------------- |
@@ -565,15 +669,66 @@ if (Test-CommandExists zoxide) {
 
 ---
 
-# 4. Help (fsh)
+# 4. コマンド履歴検索 (fhi)
 
-> **Requires:** なし（独立して動作）
+> **Requires:** PSReadLine（PowerShell標準搭載）/ fzf
+
+PSReadLine の履歴ファイルをfzfで検索し、選択したコマンドをそのまま実行します。
 
 ## 4.1 スクリプトの追記
 
 ```powershell
 # ==============================================================================
-# Part D: Help (fsh)
+# Part D: Command History Search (fhi)
+# Requires: PSReadLine (built-in), fzf
+# ==============================================================================
+
+function Invoke-FzfHistory {
+    $histFile = (Get-PSReadLineOption).HistorySavePath
+    if (Test-Path $histFile) {
+        $lines = @(Get-Content $histFile | Where-Object { $_.Trim() -ne '' })
+        [array]::Reverse($lines)
+        $source = $lines | Select-Object -Unique
+    } else {
+        $source = Get-History | Sort-Object Id -Descending | Select-Object -ExpandProperty CommandLine
+    }
+
+    $selected = $source | fzf --height 50% --layout=reverse --border --no-sort --exact --header='[fhi] History | Enter=Run'
+    if ($selected) {
+        Write-Host " >>> $selected" -ForegroundColor DarkGray
+        Invoke-Expression $selected
+    }
+}
+
+Set-Alias fhi Invoke-FzfHistory -Force
+```
+
+## 4.2 使い方まとめ
+
+| **コマンド** | **動作**                                   |
+| ------------ | ------------------------------------------ |
+| `fhi`        | コマンド履歴をfzfで検索 → **Enter**で実行  |
+
+### fhi 画面での操作
+
+| **操作**     | **動作**                          |
+| ------------ | --------------------------------- |
+| **文字入力** | 完全一致で絞り込み                |
+| **上下キー** | 候補を選択（新しい順）            |
+| **Enter**    | 選択したコマンドを実行            |
+| **Ctrl-C**   | キャンセル（何も実行しない）      |
+
+---
+
+# 5. Help (fsh)
+
+> **Requires:** なし（独立して動作）
+
+## 5.1 スクリプトの追記
+
+```powershell
+# ==============================================================================
+# Part E: Help (fsh)
 # Requires: None (works independently)
 # ==============================================================================
 
@@ -590,17 +745,21 @@ function Show-ToolkitHelp {
     Write-Host "   oe [path]  Open folder in Editor"
     Write-Host ""
     Write-Host "  [Part B] rg + fzf  -------------------------" -ForegroundColor Yellow
-    Write-Host "   fs         Search code by keyword"
+    Write-Host "   fs         Search code by keyword (sort順)"
+    Write-Host "   fsl        Live search (タイプで即検索)"
     Write-Host "   fse        Set extension filter"
     Write-Host "   fsm        Set search mode"
-    Write-Host "   fsg        Filter last fs results by filename"
+    Write-Host "   fsg        Filter last fs results"
     Write-Host "   fsd        Delete extension history"
     Write-Host ""
     Write-Host "  [Part C] zoxide  ---------------------------" -ForegroundColor Yellow
     Write-Host "   z  <word>  Jump to directory by history"
     Write-Host "   zi         Jump to directory via fzf"
     Write-Host ""
-    Write-Host "  [Part D] Help  -----------------------------" -ForegroundColor Yellow
+    Write-Host "  [Part D] History  --------------------------" -ForegroundColor Yellow
+    Write-Host "   fhi        Search command history -> Run"
+    Write-Host ""
+    Write-Host "  [Part E] Help  -----------------------------" -ForegroundColor Yellow
     Write-Host "   fsh        Show this help"
     Write-Host ""
 }
@@ -608,7 +767,7 @@ function Show-ToolkitHelp {
 Set-Alias fsh Show-ToolkitHelp -Force
 ```
 
-## 4.2 使い方
+## 5.2 使い方
 
 | **コマンド** | **動作**               |
 | ------------ | ---------------------- |

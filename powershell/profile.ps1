@@ -126,7 +126,12 @@ Set-Alias -Name oe  -Value Invoke-OpenEditor -Force
 # Dependencies: rg, fzf, bat
 # ==============================================================================
 
-$script:FsExtensions  = @()
+# --- Default Extension Filter ---
+# Customize here to pre-select extensions on every new session.
+# Example: $script:FsDefaultExtensions = @("c", "h")
+$script:FsDefaultExtensions = @()
+
+$script:FsExtensions  = $script:FsDefaultExtensions
 $script:FsCacheFile   = Join-Path $env:TEMP "fs_last_results.txt"
 $script:FsSearchMode  = @("--smart-case")
 $extHistFile = "$HOME\.fs_ext_history"
@@ -182,18 +187,26 @@ if (Test-Path -LiteralPath $fullPath) {
     return $tmp
 }
 
+
 # [fsm] Search Mode
 function Set-FsMode {
-    $modes = @("smart-case (default)", "case-sensitive", "ignore-case", "word-match", "word + case-sensitive", "word + ignore-case")
+    $modes = @(
+        "smart            lower=ignore-case / UPPER=match-case  [default]",
+        "sensitive        always match case  (Foo != foo)",
+        "insensitive      always ignore case  (Foo == foo)",
+        "word             whole word + smart  (log won't match logging)",
+        "word+sensitive   whole word + match case",
+        "word+insensitive whole word + ignore case"
+    )
     $selected = $modes | fzf --height 40% --layout=reverse --border --no-mouse --header="Search mode"
     if ($selected) {
-        switch ($selected) {
-            "smart-case (default)"  { $script:FsSearchMode = @("--smart-case") }
-            "case-sensitive"        { $script:FsSearchMode = @("--case-sensitive") }
-            "ignore-case"           { $script:FsSearchMode = @("--ignore-case") }
-            "word-match"            { $script:FsSearchMode = @("--smart-case", "--word-regexp") }
-            "word + case-sensitive" { $script:FsSearchMode = @("--case-sensitive", "--word-regexp") }
-            "word + ignore-case"    { $script:FsSearchMode = @("--ignore-case", "--word-regexp") }
+        switch -Wildcard ($selected) {
+            "smart*"            { $script:FsSearchMode = @("--smart-case") }
+            "word+sensitive*"   { $script:FsSearchMode = @("--case-sensitive", "--word-regexp") }
+            "word+insensitive*" { $script:FsSearchMode = @("--ignore-case", "--word-regexp") }
+            "word*"             { $script:FsSearchMode = @("--smart-case", "--word-regexp") }
+            "sensitive*"        { $script:FsSearchMode = @("--case-sensitive") }
+            "insensitive*"      { $script:FsSearchMode = @("--ignore-case") }
         }
         Write-Host " [ MODE ] >>> $selected" -ForegroundColor Green
     }
@@ -202,14 +215,29 @@ function Set-FsMode {
 # [fse] Extension Filter
 function Set-FsExt {
     if (-not (Test-Path $extHistFile)) { New-Item $extHistFile -Force | Out-Null }
-    $defaultExts = @("all","py","ts","js","tsx","jsx","go","rs","cs","cpp","c","rb","java","kt","vue","svelte")
+    $defaultExts = @("all","py","ts","js","tsx","jsx","go","rs","cs","cpp","c","h","rb","java","kt","vue","svelte")
     $savedExts   = @(Get-Content $extHistFile -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\w+$' })
     $allExts     = @($defaultExts) + @($savedExts | Where-Object { $defaultExts -notcontains $_ }) | Select-Object -Unique
-    $fzfResult = $allExts | fzf --multi --height 40% --layout=reverse --border --no-mouse --header="Ext" --print-query
+
+    # Currently active extensions shown first so they're easy to re-select or remove
+    $activeExts  = @($script:FsExtensions | Where-Object { $allExts -contains $_ })
+    $restExts    = @($allExts | Where-Object { $activeExts -notcontains $_ })
+    $orderedExts = @($activeExts) + @($restExts)
+    $activeLabel = if ($activeExts.Count -gt 0) { $activeExts -join "," } else { "all" }
+
+    $fzfResult = $orderedExts | fzf --multi --height 40% --layout=reverse --border --no-mouse --header="Ext | current: $activeLabel" --print-query
     $typedQuery = $fzfResult | Select-Object -First 1
     $selectedExts = @($fzfResult | Select-Object -Skip 1 | Where-Object { $_ -match '^\w+$' })
     if ($selectedExts.Count -eq 0 -and $typedQuery -ne "") { $selectedExts = @($typedQuery) }
     $script:FsExtensions = $selectedExts
+
+    # Save any newly typed (non-default, non-already-saved) extensions to history
+    foreach ($ext in $selectedExts) {
+        if ($ext -match '^\w+$' -and $defaultExts -notcontains $ext -and $savedExts -notcontains $ext) {
+            Add-Content $extHistFile $ext -Encoding UTF8
+        }
+    }
+
     Write-Host " [ EXT ] >>> $($selectedExts -join ', ')" -ForegroundColor Green
 }
 
@@ -224,43 +252,95 @@ function Remove-FsExtHistory {
 function Invoke-FzfGrepFilter {
     if (-not (Test-Path $script:FsCacheFile)) { Write-Host "Run fs first" -ForegroundColor Yellow; return }
 
-    $tmpOpen = _FsMakeTmpOpen; $tmpPreview = _FsMakeTmpPreview
-    $bindCmd = "enter:execute(powershell -NoProfile -File `"$tmpOpen`" {})+clear-selection"
+    $tmpOpen    = _FsMakeTmpOpen
+    $tmpPreview = _FsMakeTmpPreview
+    $bindCmd    = "enter:execute-silent(powershell -NoProfile -WindowStyle Hidden -File `"$tmpOpen`" {})+clear-selection"
     $previewCmd = "powershell -NoProfile -File `"$tmpPreview`" {}"
 
-    # Load results from cache file and pipe into fzf
-    Get-Content $script:FsCacheFile | fzf --ansi --height 100% --layout=reverse --border --header="[fsg] Filter Mode | F2=Preview" --preview=$previewCmd --preview-window="right:50%:hidden:wrap" --bind="f2:toggle-preview" --bind=$bindCmd
+    Get-Content $script:FsCacheFile | fzf --ansi --height 100% --layout=reverse --border --no-sort --exact --delimiter=":" --header="[fsg] F2=Preview  Alt-S=Sort  Alt-F=FileOnly  Alt-A=All" --preview=$previewCmd --preview-window="right:50%:hidden:wrap" --bind="f2:toggle-preview" --bind="alt-s:toggle-sort" --bind="alt-f:change-nth(1)+change-prompt([file] )" --bind="alt-a:change-nth()+change-prompt([fsg] )" --bind=$bindCmd
 
     Remove-Item $tmpOpen, $tmpPreview -ErrorAction SilentlyContinue
 }
 
 # [fs] Main Search Function
 function Invoke-FzfGrep {
-    $query = Read-Host "Search for"
-    if (-not $query) { return }
+    param([string]$Query)
+    if (-not $Query) { $Query = Read-Host "Search for" }
+    if (-not $Query) { return }
+    $query = $Query
 
-    $tmpOpen = _FsMakeTmpOpen; $tmpPreview = _FsMakeTmpPreview
-    $bindCmd = "enter:execute(powershell -NoProfile -File `"$tmpOpen`" {})+clear-selection"
+    $tmpOpen    = _FsMakeTmpOpen
+    $tmpPreview = _FsMakeTmpPreview
+    $bindCmd    = "enter:execute-silent(powershell -NoProfile -WindowStyle Hidden -File `"$tmpOpen`" {})+clear-selection"
     $previewCmd = "powershell -NoProfile -File `"$tmpPreview`" {}"
 
     $rgArgs = @("--line-number", "--column", "--color=always", "--no-ignore", "--max-columns", "200")
     $rgArgs += @("--glob", "!node_modules", "--glob", "!dist", "--glob", "!.git")
+    $rgArgs += "--sort=path"
     $rgArgs += $script:FsSearchMode
     if ($script:FsExtensions.Count -gt 0 -and $script:FsExtensions -notcontains "all") {
         foreach ($ext in $script:FsExtensions) { $rgArgs += "--glob"; $rgArgs += "*.$ext" }
     }
     $rgArgs += $query
 
-    Write-Host " [ SEARCHING... ]" -ForegroundColor Cyan
+    $extLabel = if ($script:FsExtensions.Count -eq 0 -or $script:FsExtensions -contains 'all') { 'all' } else { $script:FsExtensions -join ',' }
+    $fzfArgs = @(
+        "--ansi", "--height", "100%", "--layout=reverse", "--border",
+        "--no-sort", "--exact",
+        "--delimiter=:",
+        "--header=[fs] $query | EXT:$extLabel | F2=Preview  Alt-S=Sort  Alt-F=FileOnly  Alt-A=All",
+        "--preview=$previewCmd",
+        "--preview-window=right:50%:hidden:wrap",
+        "--bind=f2:toggle-preview",
+        "--bind=alt-s:toggle-sort",
+        "--bind=alt-f:change-nth(1)+change-prompt([file] )",
+        "--bind=alt-a:change-nth()+change-prompt([fs] )",
+        "--bind=$bindCmd"
+    )
 
-    # Stream results to fzf while simultaneously writing to cache file for fsg
-    & rg @rgArgs | Tee-Object -FilePath $script:FsCacheFile | fzf --ansi --height 100% --layout=reverse --border --header="[fs] $query | F2=Preview  fsg=Filter" --preview=$previewCmd --preview-window="right:50%:hidden:wrap" --bind="f2:toggle-preview" --bind=$bindCmd
+    & rg @rgArgs | Tee-Object -FilePath $script:FsCacheFile | fzf @fzfArgs
+
+    Remove-Item $tmpOpen, $tmpPreview -ErrorAction SilentlyContinue
+}
+
+# [fsl] Live Search
+function Invoke-FzfLiveSearch {
+    $tmpOpen    = _FsMakeTmpOpen
+    $tmpPreview = _FsMakeTmpPreview
+
+    # Build rg args directly — no PowerShell subprocess in reload
+    $rgArgs = @("--line-number", "--column", "--color=always", "--no-ignore", "--max-columns", "200",
+                "--glob=!node_modules", "--glob=!dist", "--glob=!.git")
+    $rgArgs += $script:FsSearchMode
+    if ($script:FsExtensions.Count -gt 0 -and $script:FsExtensions -notcontains "all") {
+        foreach ($ext in $script:FsExtensions) { $rgArgs += "--glob=*.$ext" }
+    }
+    $rgCmd = "rg " + ($rgArgs -join " ") + " -- {q}"
+
+    $bindOpen   = "enter:execute-silent(powershell -NoProfile -WindowStyle Hidden -File `"$tmpOpen`" {})+clear-selection"
+    $previewCmd = "powershell -NoProfile -File `"$tmpPreview`" {}"
+    $extLabel   = if ($script:FsExtensions.Count -eq 0 -or $script:FsExtensions -contains 'all') { 'all' } else { $script:FsExtensions -join ',' }
+
+    $fzfArgs = @(
+        "--ansi", "--height", "100%", "--layout=reverse", "--border",
+        "--disabled",
+        "--prompt=[fsl] ",
+        "--header=EXT:$extLabel | F2=Preview  Enter=Open",
+        "--preview=$previewCmd",
+        "--preview-window=right:50%:hidden:wrap",
+        "--bind=f2:toggle-preview",
+        "--bind=change:reload($rgCmd)+first",
+        "--bind=$bindOpen"
+    )
+
+    @() | fzf @fzfArgs
 
     Remove-Item $tmpOpen, $tmpPreview -ErrorAction SilentlyContinue
 }
 
 # --- Aliases ---
 Set-Alias fs  Invoke-FzfGrep       -Force
+Set-Alias fsl Invoke-FzfLiveSearch -Force
 Set-Alias fsg Invoke-FzfGrepFilter -Force
 Set-Alias fse Set-FsExt            -Force
 Set-Alias fsd Remove-FsExtHistory  -Force
@@ -286,7 +366,33 @@ if (Test-CommandExists zoxide) {
 
 
 # ==============================================================================
-# Part D: Help (fsh)
+# Part D: Command History Search (fhi)
+# Requires: PSReadLine (built-in), fzf
+# ==============================================================================
+
+function Invoke-FzfHistory {
+    $histFile = (Get-PSReadLineOption).HistorySavePath
+    if (Test-Path $histFile) {
+        $lines = @(Get-Content $histFile | Where-Object { $_.Trim() -ne '' })
+        [array]::Reverse($lines)
+        $source = $lines | Select-Object -Unique
+    } else {
+        $source = Get-History | Sort-Object Id -Descending | Select-Object -ExpandProperty CommandLine
+    }
+
+    $selected = $source | fzf --height 50% --layout=reverse --border --no-sort --exact --header='[fhi] History | Enter=Run'
+    if ($selected) {
+        Write-Host " >>> $selected" -ForegroundColor DarkGray
+        Invoke-Expression $selected
+    }
+}
+
+Set-Alias fhi Invoke-FzfHistory -Force
+
+
+
+# ==============================================================================
+# Part E: Help (fsh)
 # Requires: None (works independently)
 # ==============================================================================
 
@@ -303,17 +409,21 @@ function Show-ToolkitHelp {
     Write-Host "   oe [path]  Open folder in Editor"
     Write-Host ""
     Write-Host "  [Part B] rg + fzf  -------------------------" -ForegroundColor Yellow
-    Write-Host "   fs         Search code by keyword"
+    Write-Host "   fs         Search code by keyword (sort順)"
+    Write-Host "   fsl        Live search (タイプで即検索)"
     Write-Host "   fse        Set extension filter"
     Write-Host "   fsm        Set search mode"
-    Write-Host "   fsg        Filter last fs results by filename"
+    Write-Host "   fsg        Filter last fs results"
     Write-Host "   fsd        Delete extension history"
     Write-Host ""
     Write-Host "  [Part C] zoxide  ---------------------------" -ForegroundColor Yellow
     Write-Host "   z  <word>  Jump to directory by history"
     Write-Host "   zi         Jump to directory via fzf"
     Write-Host ""
-    Write-Host "  [Part D] Help  -----------------------------" -ForegroundColor Yellow
+    Write-Host "  [Part D] History  --------------------------" -ForegroundColor Yellow
+    Write-Host "   fhi        Search command history -> Run"
+    Write-Host ""
+    Write-Host "  [Part E] Help  -----------------------------" -ForegroundColor Yellow
     Write-Host "   fsh        Show this help"
     Write-Host ""
 }
